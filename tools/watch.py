@@ -28,7 +28,10 @@ _STEP = {0: (0, -1), 1: (0, 1), 2: (-1, 0), 3: (1, 0)}
 # Q değerleri bu eşiğin altında yayılıyorsa (kararsız) → BFS devreye girer
 _Q_CONFIDENCE = 10.0
 # Bir hücre bu kadar kez ziyaret edilirse kalıcı BFS moduna geçilir (uzun döngü kırıcı)
-_LOOP_THRESHOLD = 3
+# 2 = aynı hücreye 2. kez gelinince hemen BFS — optimal yolda hiçbir hücre iki kez ziyaret edilmez
+_LOOP_THRESHOLD = 2
+# Adım sayısı optimal BFS yolunun bu katını geçerse zorla BFS devreye girer
+_STEP_BUDGET_RATIO = 3
 
 
 def bfs_next_action(grid: np.ndarray, start: tuple, goal: tuple) -> int:
@@ -185,36 +188,72 @@ def render(env: GridEnvironment, action: int, q_values: np.ndarray,
 
 
 def run_episode(env: GridEnvironment, agent: DQLAgent,
-                episode: int, delay: float, training: bool) -> dict:
+                episode: int, delay: float, training: bool,
+                no_bfs: bool = False) -> dict:
     """Bir episode izle, sonucu döndür."""
     state = env.reset()
     total_reward = 0.0
     step = 0
     done = False
 
-    # Kısa döngü (son 8 adım) — smart_action için
-    history: deque = deque(maxlen=8)
+    # Döngü kırıcı geçmiş — saf RL'de daha uzun tutulur (no-revisit etkili olsun)
+    history_len = 16 if no_bfs else 8
+    history: deque = deque(maxlen=history_len)
     # Uzun döngü dedektörü: tüm episode boyunca ziyaret sayısı
     visit_counts: dict = {}
-    # Bir hücre 3 kez ziyaret edilirse kalıcı BFS moduna geç
-    _LOOP_THRESHOLD = 3
     bfs_forced = False
+
+    # Adım bütçesi: BFS optimal yolunun _STEP_BUDGET_RATIO katını geçince zorla BFS
+    _optimal_len = env._bfs_path_length(env.grid, env.agent_pos, env.goal_pos)
+    _step_budget = max(_optimal_len * _STEP_BUDGET_RATIO, _optimal_len + 15)
 
     while not done:
         cur_pos = env.agent_pos
         visit_counts[cur_pos] = visit_counts.get(cur_pos, 0) + 1
 
-        # Döngü tespiti: aynı hücreye LOOP_THRESHOLD kez gelinirse BFS'e kilitle
-        if not bfs_forced and visit_counts[cur_pos] >= _LOOP_THRESHOLD:
-            bfs_forced = True
+        # Döngü tespiti — sadece BFS açıksa çalışır
+        if not no_bfs and not bfs_forced:
+            loop_detected   = visit_counts[cur_pos] >= _LOOP_THRESHOLD
+            budget_exceeded = step >= _step_budget
+            if loop_detected or budget_exceeded:
+                bfs_forced = True
 
         history.append(cur_pos)
 
         if training and agent.epsilon > 0:
             action = agent.select_action(state, training=True)
             nav_mode = "ε-greedy"
+        elif no_bfs:
+            # Saf Q-network + ziyaret sayısı döngü kırıcı:
+            # Geçerli aksiyonları Q sırasına göre sırala, hedef hücrenin
+            # kaç kez ziyaret edildiğine bak. Hiç gidilmemiş varsa onu seç;
+            # hepsi ziyaret edildiyse en az ziyaret edileni seç.
+            q_vals_tmp = agent.get_q_values(state)
+            sorted_acts = np.argsort(q_vals_tmp)[::-1]
+            valid_actions = []  # (aksiyon, ziyaret_sayısı) — Q sırasına göre
+            for a in sorted_acts:
+                dr, dc = _STEP[a]
+                nr, nc = cur_pos[0] + dr, cur_pos[1] + dc
+                if not (0 <= nr < env.size and 0 <= nc < env.size):
+                    continue
+                if env.grid[nr, nc] == 1:
+                    continue
+                visits = visit_counts.get((nr, nc), 0)
+                valid_actions.append((a, visits))
+
+            if valid_actions:
+                # Hiç gidilmemiş hücre varsa → en yüksek Q'lu olanı seç
+                unvisited = [a for a, v in valid_actions if v == 0]
+                if unvisited:
+                    action = unvisited[0]
+                else:
+                    # Hepsi ziyaret edilmiş → en az ziyaret edilen, eşitlikte Q öncelikli
+                    min_v = min(v for _, v in valid_actions)
+                    action = next(a for a, v in valid_actions if v == min_v)
+            else:
+                action = int(np.argmax(q_vals_tmp))
+            nav_mode = "Q-only"
         elif bfs_forced:
-            # Uzun döngü kırıcı: tüm episode sonuna kadar saf BFS
             bfs_act = bfs_next_action(env.grid, env.agent_pos, env.goal_pos)
             action = bfs_act if bfs_act != -1 else int(
                 np.argmax(agent.get_q_values(state)))
@@ -317,6 +356,12 @@ def parse_args():
             "  extreme — engel %%30, min yol 22 adım"
         ),
     )
+    parser.add_argument(
+        "--bfs",
+        action="store_true",
+        dest="use_bfs",
+        help="BFS yardımını ve döngü kırıcıyı aç (varsayılan: kapalı — saf RL politikası)",
+    )
     return parser.parse_args()
 
 
@@ -374,10 +419,13 @@ if __name__ == "__main__":
     diff_info  = (f"engel %{int(diff_cfg['obstacle_ratio']*100)}  "
                   f"min_yol {diff_cfg['min_path_length']} adım")
     mode = "🎲 Rastgele Ajan" if args.random else f"🧠 Eğitilmiş Model ({args.model})"
+    nav_label  = (f"{CYN}Hibrit Q+BFS{R}" if args.use_bfs
+                  else f"{GRN}Saf RL (Q-network){R}")
     print(f"\n  {BOLD}Ajan İzleme{R} — {mode}")
     print(f"  Grid: {args.size}×{args.size}   Episodes: {args.episodes}   "
           f"Hız: {args.delay}s/adım   ε: {agent.epsilon:.3f}")
     print(f"  Zorluk: {BOLD}{diff_label}{R}  ({diff_info})")
+    print(f"  Navigasyon: {nav_label}")
     print(f"\n  {GRY}Başlamak için Enter'a bas...{R}")
     input()
 
@@ -387,7 +435,8 @@ if __name__ == "__main__":
         if args.map:
             env.load_from_api_payload(payload)   # aynı haritayı yenile
         result = run_episode(env, agent, ep, args.delay,
-                             training=(agent.epsilon > 0))
+                             training=(agent.epsilon > 0),
+                             no_bfs=not args.use_bfs)
         results.append(result)
 
     print_summary(results)
