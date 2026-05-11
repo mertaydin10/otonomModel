@@ -1,5 +1,5 @@
 """
-environment/grid_env.py — Grid World ortamı
+environment/grid_env.py — Grid World ortamı (v3 — hareketli engelli)
 
 Aksiyon uzayı (Spring Boot SimulationResponseDTO ile uyumlu):
   0 = LEFT  ←  (col − 1)
@@ -7,25 +7,29 @@ Aksiyon uzayı (Spring Boot SimulationResponseDTO ile uyumlu):
   2 = UP    ↑  (row − 1)
   3 = DOWN  ↓  (row + 1)
 
-Durum vektörü (12 eleman — Spring Boot Normalizer ile uyumlu):
+Durum vektörü (16 eleman — v3):
   [0]  agent_col / (size-1)          — ajan x normalize
   [1]  agent_row / (size-1)          — ajan y normalize
   [2]  goal_col  / (size-1)          — hedef x normalize
   [3]  goal_row  / (size-1)          — hedef y normalize
-  [4]  sensor_left  (0/1 anlık engel)
-  [5]  sensor_right (0/1 anlık engel)
-  [6]  sensor_up    (0/1 anlık engel)
-  [7]  sensor_down  (0/1 anlık engel)
+  [4]  sensor_left  (0/1 anlık engel — statik+dinamik)
+  [5]  sensor_right (0/1 anlık engel — statik+dinamik)
+  [6]  sensor_up    (0/1 anlık engel — statik+dinamik)
+  [7]  sensor_down  (0/1 anlık engel — statik+dinamik)
   [8]  dist_left  / (size-1)         — sol engele normalize mesafe
   [9]  dist_right / (size-1)         — sağ engele normalize mesafe
   [10] dist_up    / (size-1)         — üst engele normalize mesafe
   [11] dist_down  / (size-1)         — alt engele normalize mesafe
+  [12] nearest_dyn_dx / (size-1)     — en yakın dinamik engel relative x
+  [13] nearest_dyn_dy / (size-1)     — en yakın dinamik engel relative y
+  [14] nearest_dyn_move_dx           — en yakın dyn. engel hareket yönü x (-1/0/+1)
+  [15] nearest_dyn_move_dy           — en yakın dyn. engel hareket yönü y (-1/0/+1)
 """
 from __future__ import annotations
 
 import numpy as np
 from collections import deque
-from typing import Optional
+from typing import Optional, List
 
 # ─── Aksiyon sabitleri (Spring Boot uyumlu) ──────────────────────────────────
 ACTION_LEFT  = 0   # ←
@@ -48,14 +52,61 @@ ACTION_LABELS = {
 }
 
 
+# ─── Dinamik Engel ──────────────────────────────────────────────────────────
+
+class DynamicObstacle:
+    """
+    Hareketli engel — patrol (devriye) modunda hareket eder.
+    Duvara veya statik engele çarpınca yön tersler (bounce).
+    """
+    __slots__ = ("row", "col", "dr", "dc", "size")
+
+    def __init__(self, row: int, col: int, dr: int, dc: int, size: int):
+        self.row = row
+        self.col = col
+        self.dr = dr      # satır hareket yönü (-1, 0, +1)
+        self.dc = dc      # sütun hareket yönü (-1, 0, +1)
+        self.size = size
+
+    @property
+    def pos(self) -> tuple:
+        return (self.row, self.col)
+
+    def move(self, static_grid: np.ndarray, occupied: set) -> None:
+        """
+        Bir adım ilerle. Eğer hedef hücre duvar, statik engel,
+        sınır dışı veya başka bir dinamik engel tarafından tutuluyorsa
+        yönü tersle (bounce) ve bir adım daha dene.
+        İki denemede de hareket edemezse yerinde kal.
+        """
+        for attempt in range(2):
+            nr = self.row + self.dr
+            nc = self.col + self.dc
+            if (0 <= nr < self.size and 0 <= nc < self.size
+                    and static_grid[nr, nc] == 0
+                    and (nr, nc) not in occupied):
+                occupied.discard((self.row, self.col))
+                self.row = nr
+                self.col = nc
+                occupied.add((self.row, self.col))
+                return
+            # Bounce — yönü tersle
+            self.dr = -self.dr
+            self.dc = -self.dc
+
+    def __repr__(self) -> str:
+        return f"DynObs({self.row},{self.col} dir=({self.dr},{self.dc}))"
+
+
 class GridEnvironment:
     """
-    Grid World ortamı — DQL ajan eğitimi için.
+    Grid World ortamı — DQL ajan eğitimi için (v3 — hareketli engelli).
 
     Özellikler:
     - Çözülebilirlik garantili rastgele harita üretimi (BFS doğrulamalı)
-    - Spring Boot Normalizer ile uyumlu 12-boyutlu durum vektörü
+    - Spring Boot Normalizer ile uyumlu durum vektörü
     - Doğru ödül şekillendirmesi (önceki konuma göre mesafe farkı)
+    - Hareketli engeller (patrol/bounce)
     - GameMapDTO formatından harita yükleme
     - Bölüm başına maksimum adım sınırı
     """
@@ -67,12 +118,18 @@ class GridEnvironment:
         max_steps: int = 500,
         random_maps: bool = True,
         min_path_length: int = 0,
+        dynamic_obstacle_count: int = 0,
+        dynamic_move_interval: int = 1,
     ):
         self.size = size
         self.obstacle_ratio = obstacle_ratio
         self.max_steps = max_steps
         self.random_maps = random_maps
         self.min_path_length = min_path_length
+
+        # Dinamik engel parametreleri
+        self.dynamic_obstacle_count = dynamic_obstacle_count
+        self.dynamic_move_interval = dynamic_move_interval  # kaç step'te bir hareket
 
         self.grid = np.zeros((size, size), dtype=np.int8)
         self.start_pos = (0, 0)
@@ -81,7 +138,13 @@ class GridEnvironment:
         self.steps_taken = 0
         self._prev_dist: float = 0.0
 
-        self.state_size = 12   # Spring Boot Normalizer ile uyumlu
+        # Dinamik engel listesi
+        self.dynamic_obstacles: List[DynamicObstacle] = []
+
+        # State boyutu: 12 (statik) + 4 (dinamik) = 16
+        # dynamic_obstacle_count == 0 olduğunda bile 16 tutuyoruz
+        # böylece aynı ağ her iki modda da çalışabilir
+        self.state_size = 16
         self.action_size = 4
 
         if self.random_maps:
@@ -212,6 +275,69 @@ class GridEnvironment:
 
         self._generate_from_data(grid, start, goal)
 
+    # ─── Dinamik Engel Yönetimi ──────────────────────────────────────────────
+
+    def _spawn_dynamic_obstacles(self) -> None:
+        """
+        Rastgele pozisyon ve yönlerle dinamik engeller oluşturur.
+        Start, goal ve statik engel olmayan hücrelere yerleştirilir.
+        """
+        self.dynamic_obstacles.clear()
+        if self.dynamic_obstacle_count <= 0:
+            return
+
+        # Kullanılabilir hücreleri bul
+        forbidden = {self.start_pos, self.goal_pos}
+        free_cells = []
+        for r in range(self.size):
+            for c in range(self.size):
+                if self.grid[r, c] == 0 and (r, c) not in forbidden:
+                    free_cells.append((r, c))
+
+        if len(free_cells) == 0:
+            return
+
+        # Rastgele konumlar seç
+        n = min(self.dynamic_obstacle_count, len(free_cells))
+        chosen_indices = np.random.choice(len(free_cells), n, replace=False)
+
+        # Yön seçenekleri — sadece yatay veya dikey (çapraz hareket yok)
+        directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+
+        for idx in chosen_indices:
+            r, c = free_cells[idx]
+            dr, dc = directions[np.random.randint(len(directions))]
+            obs = DynamicObstacle(r, c, dr, dc, self.size)
+            self.dynamic_obstacles.append(obs)
+
+    def _move_dynamic_obstacles(self) -> None:
+        """Tüm dinamik engelleri bir adım hareket ettirir."""
+        if not self.dynamic_obstacles:
+            return
+
+        # Mevcut dinamik engellerin pozisyon kümesi
+        occupied = {obs.pos for obs in self.dynamic_obstacles}
+
+        for obs in self.dynamic_obstacles:
+            obs.move(self.grid, occupied)
+
+    def _is_dynamic_obstacle(self, row: int, col: int) -> bool:
+        """Verilen hücrede dinamik engel var mı?"""
+        for obs in self.dynamic_obstacles:
+            if obs.row == row and obs.col == col:
+                return True
+        return False
+
+    def _is_blocked(self, row: int, col: int) -> bool:
+        """Verilen hücre statik veya dinamik engelle bloke mu?"""
+        if self.grid[row, col] == 1:
+            return True
+        return self._is_dynamic_obstacle(row, col)
+
+    def _get_dynamic_positions(self) -> set:
+        """Dinamik engel pozisyonları kümesi."""
+        return {obs.pos for obs in self.dynamic_obstacles}
+
     # ─── Ortam API ────────────────────────────────────────────────────────────
 
     def reset(
@@ -246,6 +372,9 @@ class GridEnvironment:
         )
         self._visited: dict = {self.start_pos: 1}  # hücre → ziyaret sayısı
 
+        # Dinamik engelleri yeniden oluştur
+        self._spawn_dynamic_obstacles()
+
     def step(self, action: int) -> tuple:
         """
         Ajan bir adım atar.
@@ -268,9 +397,14 @@ class GridEnvironment:
             info["status"] = "out_of_bounds"
             return self._get_state(), -10.0, True, info
 
-        # Engel çarpması
+        # Statik engel çarpması
         if self.grid[nr, nc] == 1:
             info["status"] = "hit_obstacle"
+            return self._get_state(), -50.0, True, info
+
+        # Dinamik engel çarpması (ajanın gittiği hücre)
+        if self._is_dynamic_obstacle(nr, nc):
+            info["status"] = "hit_dynamic_obstacle"
             return self._get_state(), -50.0, True, info
 
         # Konumu güncelle
@@ -285,6 +419,16 @@ class GridEnvironment:
             self._prev_dist = 0.0
             return self._get_state(), +100.0, True, info
 
+        # ── Dinamik engelleri hareket ettir (ajan adımından SONRA) ──────────
+        if (self.dynamic_obstacles
+                and self.steps_taken % self.dynamic_move_interval == 0):
+            self._move_dynamic_obstacles()
+
+            # Hareket ettikten sonra dinamik engel ajanın üstüne geldiyse
+            if self._is_dynamic_obstacle(*self.agent_pos):
+                info["status"] = "dynamic_obstacle_hit_agent"
+                return self._get_state(), -50.0, True, info
+
         # Maksimum adım
         if self.steps_taken >= self.max_steps:
             info["status"] = "max_steps_reached"
@@ -296,25 +440,46 @@ class GridEnvironment:
             + abs(self.agent_pos[1] - self.goal_pos[1])
         )
         if curr_dist < self._prev_dist:
-            reward = +2.0        # +1.0 → +2.0: hedefe yaklaşma sinyali güçlendirildi
+            reward = +2.0        # hedefe yaklaşma sinyali
         else:
             reward = -0.5
         reward -= 0.1            # adım cezası (gereksiz dolaşmayı önler)
+
+        # Dinamik engele yakınlık bonusu/cezası
+        if self.dynamic_obstacles:
+            min_dyn_dist = self._nearest_dynamic_dist()
+            if min_dyn_dist <= 1:
+                reward -= 1.0    # çok yakın — tehlike cezası
+            elif min_dyn_dist <= 2:
+                reward -= 0.3    # yaklaşıyor — hafif ceza
 
         self._prev_dist = curr_dist
 
         info["status"] = "ok"
         return self._get_state(), reward, False, info
 
-    # ─── Durum Vektörü (12 eleman) ───────────────────────────────────────────
+    # ─── Durum Vektörü (16 eleman) ───────────────────────────────────────────
+
+    def _nearest_dynamic_dist(self) -> float:
+        """Ajanın en yakın dinamik engele Manhattan mesafesi."""
+        if not self.dynamic_obstacles:
+            return float(self.size * 2)  # çok uzak
+        row, col = self.agent_pos
+        min_dist = float("inf")
+        for obs in self.dynamic_obstacles:
+            d = abs(obs.row - row) + abs(obs.col - col)
+            if d < min_dist:
+                min_dist = d
+        return min_dist
 
     def _get_state(self) -> np.ndarray:
         """
-        12-boyutlu durum vektörü üretir (Spring Boot Normalizer ile uyumlu).
+        16-boyutlu durum vektörü üretir (v3).
 
         [0..3]  Normalize pozisyonlar (agent_col, agent_row, goal_col, goal_row)
-        [4..7]  Anlık engel sensörleri (LEFT, RIGHT, UP, DOWN)
+        [4..7]  Anlık engel sensörleri (LEFT, RIGHT, UP, DOWN) — statik + dinamik
         [8..11] Yön bazlı engel mesafeleri normalize (LEFT, RIGHT, UP, DOWN)
+        [12..15] En yakın dinamik engel bilgisi
         """
         s = max(self.size - 1, 1)
         row, col = self.agent_pos
@@ -323,15 +488,20 @@ class GridEnvironment:
         imm = np.zeros(4, dtype=np.float32)
         dist = np.zeros(4, dtype=np.float32)
 
+        # Dinamik engel pozisyonlarını al
+        dyn_positions = self._get_dynamic_positions()
+
         for act in range(4):      # 0=LEFT,1=RIGHT,2=UP,3=DOWN
             dr, dc = DELTA[act]
             nr, nc = row + dr, col + dc
 
-            # Anlık sensör
-            if not (0 <= nr < self.size and 0 <= nc < self.size) or self.grid[nr, nc] == 1:
+            # Anlık sensör — statik + dinamik engeller
+            if not (0 <= nr < self.size and 0 <= nc < self.size):
+                imm[act] = 1.0
+            elif self.grid[nr, nc] == 1 or (nr, nc) in dyn_positions:
                 imm[act] = 1.0
 
-            # Mesafe sensörü (ışın atışı)
+            # Mesafe sensörü (ışın atışı) — statik + dinamik
             r, c = row, col
             d = 0
             while True:
@@ -339,15 +509,38 @@ class GridEnvironment:
                 if not (0 <= r < self.size and 0 <= c < self.size):
                     break
                 d += 1
-                if self.grid[r, c] == 1:
+                if self.grid[r, c] == 1 or (r, c) in dyn_positions:
                     break
             dist[act] = d / s
+
+        # Dinamik engel bilgisi
+        nearest_dx = 0.0
+        nearest_dy = 0.0
+        nearest_move_dx = 0.0
+        nearest_move_dy = 0.0
+
+        if self.dynamic_obstacles:
+            # En yakın dinamik engeli bul
+            min_dist = float("inf")
+            nearest_obs = None
+            for obs in self.dynamic_obstacles:
+                d = abs(obs.row - row) + abs(obs.col - col)
+                if d < min_dist:
+                    min_dist = d
+                    nearest_obs = obs
+            if nearest_obs is not None:
+                nearest_dx = (nearest_obs.col - col) / s
+                nearest_dy = (nearest_obs.row - row) / s
+                nearest_move_dx = float(nearest_obs.dc)
+                nearest_move_dy = float(nearest_obs.dr)
 
         state = np.array([
             col / s, row / s,           # ajan x, y
             gcol / s, grow / s,         # hedef x, y
             imm[0], imm[1], imm[2], imm[3],
             dist[0], dist[1], dist[2], dist[3],
+            nearest_dx, nearest_dy,     # en yakın dinamik engel göreceli pozisyon
+            nearest_move_dx, nearest_move_dy,  # en yakın dinamik engel hareket yönü
         ], dtype=np.float32)
 
         return state
@@ -358,9 +551,13 @@ class GridEnvironment:
         """Grid'i terminalde görselleştirir."""
         symbols = np.full((self.size, self.size), " · ")
         symbols[self.grid == 1] = "███"
+        # Dinamik engeller
+        for obs in self.dynamic_obstacles:
+            symbols[obs.row, obs.col] = " ◆ "
         symbols[self.start_pos] = " S "
         symbols[self.goal_pos]  = " G "
         if self.agent_pos not in (self.start_pos, self.goal_pos):
             symbols[self.agent_pos] = " A "
         print("\n".join("".join(r) for r in symbols))
-        print(f"Adım: {self.steps_taken}  Pos: {self.agent_pos}  Mesafe: {int(self._prev_dist)}")
+        print(f"Adım: {self.steps_taken}  Pos: {self.agent_pos}  Mesafe: {int(self._prev_dist)}"
+              f"  DynObs: {len(self.dynamic_obstacles)}")

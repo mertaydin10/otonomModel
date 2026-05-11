@@ -1,7 +1,8 @@
 """
-train.py — DQL Eğitim Döngüsü
-Çoklu harita üzerinde ajan eğitimi, canlı istatistik çıktısı
-ve otomatik model kaydetme içerir.
+train_v3.py — DQL Eğitim Döngüsü (v3 — Hareketli Engelli)
+
+Statik engellerden başlayıp kademeli olarak hareketli engeller eklenen
+curriculum eğitimi. Mevcut v2 modelinden transfer learning destekler.
 """
 import os
 import sys
@@ -27,36 +28,41 @@ DEFAULT_CONFIG = {
     "random_maps":     True,
 
     # Eğitim
-    "max_episodes":    10_000,
-    "max_steps":       300,        # 500 → 300: uzun aimless wandering'i kırpar
+    "max_episodes":    15_000,
+    "max_steps":       400,         # dinamik engelli haritalarda daha fazla süre
     "train_every":     4,
 
     # Ajan
-    "learning_rate":   0.001,
+    "learning_rate":   0.0005,      # daha düşük lr — transfer learning için stabil
     "gamma":           0.99,
     "epsilon_start":   1.0,
     "epsilon_min":     0.01,
-    "epsilon_decay":   0.9985,
+    "epsilon_decay":   0.9990,      # daha yavaş decay — keşif daha uzun sürer
     "batch_size":      64,
-    "buffer_capacity": 30_000,
+    "buffer_capacity": 50_000,      # daha büyük buffer — çeşitli deneyimler
     "target_update":   10,
-    "hidden_size":     128,
+    "hidden_size":     256,         # büyük ağ — dinamik ortam daha karmaşık
 
     # Kayıt
-    "save_every":      200,
-    "model_path":      "models/best_model_v2.pth",
-    "stats_path":      "models/training_stats_v2.json",
+    "save_every":      300,
+    "model_path":      "models/best_model_v3.pth",
+    "stats_path":      "models/training_stats_v3.json",
 }
 
-# ─── Curriculum Aşamaları (Başarı Eşikli) ────────────────────────────────────
-# Bir sonraki faza geçiş için son 100 episode'da bu başarı oranı sağlanmalı.
-# min_episodes: bu fazda en az bu kadar episode geçirilir (erken geçişi önler).
-# Ajan bir fazda gerçekten öğrenmeden ilerlememeli — aksi halde Faz 4'te çöküyor.
+# ─── Curriculum Aşamaları (Yoğun Hareketli Engel) ────────────────────────────
+# (engel_oranı, min_yol, dyn_engel_sayısı, dyn_hareket_interval,
+#  geçiş_başarı_eşiği, min_episode)
+#
+# Hareketli engel arttıkça statik engel azalır — ajan çaresiz kalmasın.
+# Toplam zorluk dengeli: az statik + çok dinamik = zor ama adil.
+
 CURRICULUM = [
-    # (engel_oranı, min_yol, geçiş_başarı_eşiği, min_episode)
-    (0.12,  0,  0.70,  1000),   # Faz 1: Kolay — %70 başarıya ulaşınca geç
-    (0.18,  8,  0.65,  1500),   # Faz 2: Orta  — %65 başarıya ulaşınca geç
-    (0.23, 14,  0.00,  3000),   # Faz 3: Zor   — son faz, kalan süre burada
+    # (obs_ratio, min_path, dyn_count, dyn_interval, threshold, min_ep)
+    (0.15,  5, 3, 1, 0.55, 1500),    # Faz 1: 3 dyn, %15 statik — ısınma
+    (0.13,  5, 5, 1, 0.50, 2000),    # Faz 2: 5 dyn, %13 statik
+    (0.10,  5, 6, 1, 0.45, 2500),    # Faz 3: 6 dyn, %10 statik
+    (0.08,  5, 7, 1, 0.40, 3000),    # Faz 4: 7 dyn, %8 statik
+    (0.08,  5, 8, 1, 0.00, 4000),    # Faz 5: Son faz — 8 dyn, %8 statik
 ]
 
 
@@ -72,6 +78,8 @@ def print_progress(
     success_rate:  float,
     window_reward: float,
     elapsed:       float,
+    phase:         int,
+    dyn_count:     int,
 ) -> None:
     """Terminal ilerleme çubuğu."""
     bar_width  = 20
@@ -81,6 +89,8 @@ def print_progress(
 
     loss_str = f"{loss:.4f}" if loss is not None else "  N/A "
 
+    dyn_str = f"Dyn:{dyn_count}" if dyn_count > 0 else "Static"
+
     print(
         f"\r[{bar}] {episode:4d}/{total} | "
         f"R:{reward:+7.1f} | "
@@ -89,6 +99,8 @@ def print_progress(
         f"ε:{epsilon:.3f} | "
         f"Loss:{loss_str} | "
         f"Succ:{success_rate:.1%} | "
+        f"{dyn_str} | "
+        f"F{phase} | "
         f"{elapsed:.0f}s",
         end="",
         flush=True,
@@ -97,7 +109,7 @@ def print_progress(
 
 def train(config: dict, resume: bool = False) -> None:
     """
-    Ana eğitim döngüsü.
+    Ana eğitim döngüsü (v3 — hareketli engelli).
 
     Args:
         config: Hiperparametre sözlüğü
@@ -105,26 +117,23 @@ def train(config: dict, resume: bool = False) -> None:
     """
     # ── Curriculum aşamalarını belirle ────────────────────────────────────
     curriculum = config.get("curriculum", CURRICULUM)
-    # Aktif faz indeksi ve o fazda geçirilen episode sayısı
     phase_idx       = 0
-    phase_episodes  = 0   # bu fazda kaç episode geçirildi
+    phase_episodes  = 0
 
     # ── Ortam ve Ajan ──────────────────────────────────────────────────────
-    first_phase = curriculum[0]   # (obs_ratio, min_path, threshold, min_ep)
+    first_phase = curriculum[0]
     env = GridEnvironment(
-        size             = config["grid_size"],
-        obstacle_ratio   = first_phase[0],
-        min_path_length  = first_phase[1],
-        max_steps        = config["max_steps"],
-        random_maps      = config["random_maps"],
+        size                   = config["grid_size"],
+        obstacle_ratio         = first_phase[0],
+        min_path_length        = first_phase[1],
+        max_steps              = config["max_steps"],
+        random_maps            = config["random_maps"],
+        dynamic_obstacle_count = first_phase[2],
+        dynamic_move_interval  = first_phase[3],
     )
 
-    # v2 eğitimi: 12-elemanlı state kullan (dinamik engel yok)
-    # Ortam 16 elemanlı state üretir ama son 4'ü sıfır olacak (dyn=0)
-    v2_state_size = 12
-
     agent = DQLAgent(
-        state_size      = v2_state_size,
+        state_size      = env.state_size,    # 16
         action_size     = env.action_size,
         hidden_size     = config["hidden_size"],
         learning_rate   = config["learning_rate"],
@@ -143,18 +152,22 @@ def train(config: dict, resume: bool = False) -> None:
         if loaded:
             agent.epsilon = max(agent.epsilon_min, agent.epsilon)
 
-    print(f"\n{'='*60}")
-    print(f" DQL Otonom Sürüş — Curriculum Eğitimi v2")
-    print(f"{'='*60}")
+    print(f"\n{'='*65}")
+    print(f" DQL Otonom Sürüş — Hareketli Engel Eğitimi v3")
+    print(f"{'='*65}")
     print(f" Grid: {config['grid_size']}×{config['grid_size']}")
+    print(f" State boyutu: {env.state_size}")
+    print(f" Hidden size: {config['hidden_size']}")
     print(f" Max episode: {config['max_episodes']}")
     print(f" Max adım/ep: {config['max_steps']}")
     print(f" Cihaz: {agent.device}")
-    print(f"\n Curriculum (başarı eşikli geçiş):")
-    for i, (obs, mpl, thr, min_ep) in enumerate(curriculum):
+    print(f"\n Curriculum (hareketli engelli):")
+    for i, (obs, mpl, dyn, dint, thr, min_ep) in enumerate(curriculum):
         label = "son faz" if thr == 0 else f"geçiş: ≥%{int(thr*100)} başarı"
-        print(f"   Faz {i+1}: engel %{int(obs*100):2d} | min yol {mpl:2d} | min {min_ep} ep | {label}")
-    print(f"{'='*60}\n")
+        dyn_label = f"{dyn} dyn (int:{dint})" if dyn > 0 else "statik"
+        print(f"   Faz {i+1}: engel %{int(obs*100):2d} | min yol {mpl:2d} | "
+              f"{dyn_label:16s} | min {min_ep} ep | {label}")
+    print(f"{'='*65}\n")
 
     # ── İstatistik Takibi ──────────────────────────────────────────────────
     all_rewards:    list = []
@@ -166,11 +179,14 @@ def train(config: dict, resume: bool = False) -> None:
     best_avg_reward = float("-inf")
     start_time      = time.time()
 
+    # Mevcut faz değerleri
+    cur_dyn_count = first_phase[2]
+
     # ── Episode Döngüsü ────────────────────────────────────────────────────
     for episode in range(1, config["max_episodes"] + 1):
 
         # ── Curriculum: başarı eşiği sağlandıysa sonraki faza geç ──────────
-        cur_obs, cur_mpl, cur_thr, cur_min = curriculum[phase_idx]
+        cur_obs, cur_mpl, cur_dyn, cur_dint, cur_thr, cur_min = curriculum[phase_idx]
         phase_episodes += 1
 
         if (phase_idx < len(curriculum) - 1          # son faz değilse
@@ -180,15 +196,20 @@ def train(config: dict, resume: bool = False) -> None:
                 and float(np.mean(success_window)) >= cur_thr):
             phase_idx      += 1
             phase_episodes  = 0
-            cur_obs, cur_mpl, cur_thr, cur_min = curriculum[phase_idx]
+            cur_obs, cur_mpl, cur_dyn, cur_dint, cur_thr, cur_min = curriculum[phase_idx]
             env.obstacle_ratio  = cur_obs
             env.min_path_length = cur_mpl
+            env.dynamic_obstacle_count = cur_dyn
+            env.dynamic_move_interval  = cur_dint
+            cur_dyn_count = cur_dyn
+            dyn_label = f"{cur_dyn} dyn engel (int:{cur_dint})" if cur_dyn > 0 else "statik"
             print(f"\n  ✅ Curriculum Faz {phase_idx+1}: "
                   f"engel %{int(cur_obs*100)} | "
-                  f"min yol {cur_mpl} adım  "
+                  f"min yol {cur_mpl} adım | "
+                  f"{dyn_label}  "
                   f"(başarı: {float(np.mean(success_window)):.1%})")
 
-        state        = env.reset()[:v2_state_size]  # 16→12 dilimle (v2 compat)
+        state        = env.reset()
         total_reward = 0.0
         ep_losses    = []
         done         = False
@@ -198,8 +219,7 @@ def train(config: dict, resume: bool = False) -> None:
             action = agent.select_action(state, training=True)
 
             # Adımı at
-            next_state_full, reward, done, info = env.step(action)
-            next_state = next_state_full[:v2_state_size]  # 16→12
+            next_state, reward, done, info = env.step(action)
 
             # Deneyimi kaydet
             agent.remember(state, action, reward, next_state, done)
@@ -246,12 +266,15 @@ def train(config: dict, resume: bool = False) -> None:
             success_rate  = success_rate,
             window_reward = avg_reward,
             elapsed       = elapsed,
+            phase         = phase_idx + 1,
+            dyn_count     = cur_dyn_count,
         )
 
         # Her 10 episode'da faz bilgisiyle yeni satır
         if episode % 10 == 0:
+            dyn_info = f"dyn:{cur_dyn_count}" if cur_dyn_count > 0 else "static"
             print(f" [Faz {phase_idx+1} | engel%{int(cur_obs*100)} | "
-                  f"faz_ep:{phase_episodes}]")
+                  f"{dyn_info} | faz_ep:{phase_episodes}]")
 
         # En iyi modeli kaydet
         if avg_reward > best_avg_reward and len(reward_window) == window_size:
@@ -265,12 +288,12 @@ def train(config: dict, resume: bool = False) -> None:
             agent.save(ckpt_path)
 
     # ── Eğitim Sonu ──────────────────────────────────────────────────────
-    print(f"\n\n{'='*60}")
+    print(f"\n\n{'='*65}")
     print(f" ✅ Eğitim tamamlandı!")
     print(f" Son 100 episode başarı oranı: {np.mean(list(success_window)):.1%}")
     print(f" Son 100 episode ortalama ödül: {np.mean(list(reward_window)):.1f}")
     print(f" Toplam süre: {(time.time()-start_time)/60:.1f} dakika")
-    print(f"{'='*60}\n")
+    print(f"{'='*65}\n")
 
     # İstatistikleri kaydet
     stats = {
@@ -296,7 +319,7 @@ def train(config: dict, resume: bool = False) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="🚗 DQL Otonom Sürüş Eğitimi",
+        description="🚗 DQL Otonom Sürüş — Hareketli Engel Eğitimi v3",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--episodes",       type=int,   default=DEFAULT_CONFIG["max_episodes"],  help="Episode sayısı")
@@ -304,6 +327,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr",             type=float, default=DEFAULT_CONFIG["learning_rate"], help="Öğrenme hızı")
     parser.add_argument("--gamma",          type=float, default=DEFAULT_CONFIG["gamma"],         help="İndirim faktörü")
     parser.add_argument("--batch-size",     type=int,   default=DEFAULT_CONFIG["batch_size"],    help="Mini-batch boyutu")
+    parser.add_argument("--hidden-size",    type=int,   default=DEFAULT_CONFIG["hidden_size"],   help="Hidden katman boyutu")
     parser.add_argument("--model-path",     type=str,   default=DEFAULT_CONFIG["model_path"],    help="Model kayıt yolu")
     parser.add_argument("--resume",         action="store_true",                                 help="Mevcut modelden devam et")
     parser.add_argument("--no-random-maps", action="store_true",                                 help="Sabit harita kullan")
@@ -319,6 +343,7 @@ if __name__ == "__main__":
     config["learning_rate"] = args.lr
     config["gamma"]         = args.gamma
     config["batch_size"]    = args.batch_size
+    config["hidden_size"]   = args.hidden_size
     config["model_path"]    = args.model_path
     config["random_maps"]   = not args.no_random_maps
 
