@@ -31,3 +31,22 @@ build/
 # Ara checkpoint modelleri (ep bazlı) — sadece final/best tutulur
 models/best_model_v2_ep*.pth
 models/best_model_curriculum_ep*.pth
+<<<<<<< Updated upstream
+=======
+models/best_model_v3_ep*.pth
+
+# Loglar ve geçici dosyalar
+*.log
+train_log.txt
+training.log
+
+# Debug/test scriptleri
+test_*.py
+
+# Oluşturulan dokümantasyon
+*_FIX.md
+*_SUMMARY.md
+
+# Claude internal
+.claude/
+>>>>>>> Stashed changes

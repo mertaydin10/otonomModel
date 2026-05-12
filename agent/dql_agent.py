@@ -1,6 +1,6 @@
 """
 dql_agent.py — Double Dueling DQN Agent
-ε-greedy politika, experience replay ve hedef ağ güncellemesi içerir.
+eps-greedy politika, experience replay ve hedef ağ güncellemesi içerir.
 """
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ class DQLAgent:
     Özellikler:
     - Double DQN: hedef değerleri online ağ seçer, hedef ağ hesaplar
     - Dueling Network: Q-Network içinde value ve advantage stream'leri
-    - ε-greedy keşif stratejisi (üstel azalma)
+    - eps-greedy keşif stratejisi (üstel azalma)
     - Periyodik hedef ağ güncellemesi
     - Model kaydetme / yükleme
     """
@@ -73,7 +73,7 @@ class DQLAgent:
         self.batch_size  = batch_size
         self.target_update = target_update
 
-        # ε-greedy parametreleri
+        # eps-greedy parametreleri
         self.epsilon       = epsilon_start
         self.epsilon_min   = epsilon_min
         self.epsilon_decay = epsilon_decay
@@ -100,7 +100,7 @@ class DQLAgent:
 
     def select_action(self, state: np.ndarray, training: bool = True) -> int:
         """
-        ε-greedy aksiyon seçimi.
+        eps-greedy aksiyon seçimi.
 
         Args:
             state:    Durum vektörü
@@ -239,7 +239,7 @@ class DQLAgent:
         self.epsilon     = checkpoint["epsilon"]
         self.total_steps = checkpoint["total_steps"]
         self.episode_count = checkpoint["episode_count"]
-        print(f"[DQL] Model yüklendi: {path} (Episode: {self.episode_count}, ε: {self.epsilon:.3f})")
+        print(f"[DQL] Model yuklendi: {path} (Episode: {self.episode_count}, eps: {self.epsilon:.3f})")
         return True
 
     def get_stats(self) -> Dict[str, Any]:
