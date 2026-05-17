@@ -222,7 +222,7 @@ async def select_model(req: SelectModelRequest):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         if req.model_key == "ppo_stage_4_hardcore":
-            new_path = os.path.join(os.path.dirname(project_root), "ppo_stage_4_hardcore")
+            new_path = os.path.join(project_root, "models", "ppo_stage_4_hardcore")
         else:
             new_path = os.path.join(project_root, "models", f"{req.model_key}.pth")
             
