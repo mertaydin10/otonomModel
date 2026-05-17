@@ -70,22 +70,35 @@ app.add_middleware(
 
 # ─── Global Durum ─────────────────────────────────────────────────────────────
 
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "models", "best_model_v2.pth"
-)
-DEFAULT_SIZE = 15
+import torch
+from agent.ppo_agent import PPOAgent
+from collections import deque
 
-env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True)
-# Model config: state_size=12, hidden_size=128 (curriculum training)
-agent = DQLAgent(
-    state_size=env.state_size,
-    action_size=env.action_size,
-    hidden_size=128  # Match best_model_curriculum_final.pth
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "ppo_stage_4_hardcore"
 )
+DEFAULT_SIZE = 20  # PPO hardcore model 20x20 veya 25x25 gridler için optimize edilmiş durumda
+
+# Model tipini otomatik tespit et
+IS_PPO = os.path.exists(os.path.join(MODEL_PATH, "policy.pth")) or "ppo" in MODEL_PATH.lower()
+
+if IS_PPO:
+    print(f"[INIT] PPO Hardcore Model tespit edildi! Model: {MODEL_PATH}")
+    env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=102)
+    agent = PPOAgent(state_size=102, action_size=5)
+else:
+    print(f"[INIT] DQN Model tespit edildi! Model: {MODEL_PATH}")
+    env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=16)
+    agent = DQLAgent(
+        state_size=16,
+        action_size=env.action_size,
+        hidden_size=256
+    )
+
 try:
     agent.load(MODEL_PATH)
 except Exception as _load_err:
-    print(f"[WARN] Model yüklenemedi (boyut uyuşmazlığı?), yeni ağırlıklarla başlanıyor: {_load_err}")
+    print(f"[WARN] Model yüklenemedi, yeni ağırlıklarla başlanıyor: {_load_err}")
 
 training_state: Dict[str, Any] = {
     "running": False,
@@ -160,7 +173,7 @@ async def load_map(payload: MapPayload):
 
         # Fresh GridEnvironment instance
         size = payload_dict["grid_size"]["x"]
-        env = GridEnvironment(size=size, random_maps=False)
+        env = GridEnvironment(size=size, random_maps=False, state_size=16)
 
         # Harita yükle — inline implementation
         half = size // 2
@@ -375,7 +388,92 @@ async def stop_training():
     return {"status": "stopped", "episode": training_state["episode"]}
 
 
+
 # ─── WebSocket Simülasyon ─────────────────────────────────────────────────────
+
+import math
+
+def get_ppo_observation(env, view_radius=7):
+    # PPO visit_map ve action_history'yi GridEnvironment nesnesine bağla
+    if not hasattr(env, "visit_map"):
+        env.visit_map = np.zeros((env.size, env.size), dtype=np.float32)
+        env.visit_map[env.agent_pos[0], env.agent_pos[1]] += 1.0
+        
+    if not hasattr(env, "action_history"):
+        env.action_history = deque([[0.0]*5 for _ in range(8)], maxlen=8)
+
+    obs = []
+    
+    # 1. Işınlar (Raycasts)
+    dirs = [(0,-1), (1,-1), (1,0), (1,1), (0,1), (-1,1), (-1,0), (-1,-1)]
+    
+    # Statik engelleri row, col formatında set yapalım (PPO notebook ile %100 uyumlu)
+    static_obs = set()
+    for r in range(env.size):
+        for c in range(env.size):
+            if env.grid[r, c] == 1:
+                static_obs.add((r, c))
+
+    # Dinamik engelleri PPO modelinin beklentisine uygun biçimde tanımla
+    class PPODynObs:
+        def __init__(self, row, col, dr, dc):
+            self.x = float(row)
+            self.y = float(col)
+            self.vx = float(dr)
+            self.vy = float(dc)
+        @property
+        def grid_pos(self):
+            return (int(round(self.x)), int(round(self.y)))
+        def normalized_velocity(self, max_speed):
+            # Ölçeği PPO eğitimindeki sabit 0.5 hızına göre normalize et (en kritik çarpışma önleme hassasiyeti)
+            vx_scaled = 0.5 if self.vx > 0 else (-0.5 if self.vx < 0 else 0.0)
+            vy_scaled = 0.5 if self.vy > 0 else (-0.5 if self.vy < 0 else 0.0)
+            return (vx_scaled, vy_scaled)
+
+    ppo_dyn_obs = []
+    for o in env.dynamic_obstacles:
+        # DummyObs sınıfından dr (row farkı) ve dc (col farkı) yönlerini doğrudan alıyoruz
+        ppo_dyn_obs.append(PPODynObs(o.row, o.col, o.dr, o.dc))
+
+    dyn_positions_dict = {dyn.grid_pos: dyn for dyn in ppo_dyn_obs}
+
+    for dx, dy in dirs:
+        hit_data = [1.0, 0.0, 0.0, 0.0]
+        for step in range(1, view_radius + 1):
+            rx, ry = env.agent_pos[0] + dx*step, env.agent_pos[1] + dy*step
+            if rx < 0 or rx >= env.size or ry < 0 or ry >= env.size or (rx, ry) in static_obs:
+                hit_data = [step/view_radius, 1.0, 0.0, 0.0]
+                break
+            if (rx, ry) in dyn_positions_dict:
+                dyn = dyn_positions_dict[(rx, ry)]
+                nvx, nvy = dyn.normalized_velocity(1.0)
+                hit_data = [step/view_radius, 0.5, nvx, nvy]
+                break
+        obs.extend(hit_data)
+
+    # 2. Hedefe Kalan Mesafe ve Açı (PPO modelinde x=row, y=col koordinat farkıdır)
+    delta_x = (env.goal_pos[0] - env.agent_pos[0]) / env.size
+    delta_y = (env.goal_pos[1] - env.agent_pos[1]) / env.size
+    dist_norm = math.hypot(delta_x, delta_y) / math.sqrt(2)
+    angle = math.atan2(delta_y, delta_x)
+    obs.extend([delta_x, delta_y, dist_norm, math.sin(angle), math.cos(angle)])
+
+    # 3. Ziyaret Haritası (Agent merkezli 5x5 bölge, doğrudan row/col şeklinde)
+    max_vis = max(1.0, np.max(env.visit_map))
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            px, py = env.agent_pos[0]+dx, env.agent_pos[1]+dy
+            if 0 <= px < env.size and 0 <= py < env.size:
+                obs.append(env.visit_map[px, py] / max_vis)
+            else:
+                obs.append(1.0)
+
+    # 4. Aksiyon Geçmişi
+    for act_arr in env.action_history:
+        obs.extend(act_arr)
+
+    return np.array(obs, dtype=np.float32)
+
 
 @app.websocket("/ws/simulate")
 async def ws_simulate(ws: WebSocket):
@@ -428,49 +526,178 @@ async def ws_simulate(ws: WebSocket):
                     env.steps_taken = 0
                     env._prev_dist = float(abs(start[0] - goal[0]) + abs(start[1] - goal[1]))
                     env._visited = {start: 1}
+                    if IS_PPO:
+                        if hasattr(env, "visit_map"): delattr(env, "visit_map")
+                        if hasattr(env, "action_history"): delattr(env, "action_history")
 
-                # Durum vektörü
-                if tick.get("state") is not None:
-                    state = np.array(tick["state"], dtype=np.float32)
+                # Hareketli engellerin senkronizasyonu
+                if tick.get("dynamic_obstacles") is not None:
+                    class DummyObs:
+                        def __init__(self, pos, dr=0.0, dc=0.0):
+                            self.pos = pos
+                            self.row = pos[0]
+                            self.col = pos[1]
+                            self.dr = dr
+                            self.dc = dc
+                    
+                    # Önceki adımdaki engellerin konum kopyasını al (Geçiş çarpışması denetimi ve yön hesabı için)
+                    old_dyn_obs = list(env.dynamic_obstacles) if hasattr(env, "dynamic_obstacles") else []
+
+                    dyn_obs = []
+                    half = env.size // 2
+                    def api_to_idx(x: int, y: int) -> tuple:
+                        return (half - y, x + half)
+                        
+                    for idx, d_cart in enumerate(tick["dynamic_obstacles"]):
+                        d_idx = api_to_idx(d_cart["x"], d_cart["y"])
+                        # Önceki adıma göre hareket yönünü (dr, dc) hesapla
+                        dr, dc = 0.0, 0.0
+                        if idx < len(old_dyn_obs):
+                            prev_obs = old_dyn_obs[idx]
+                            dr = float(d_idx[0] - prev_obs.row)
+                            dc = float(d_idx[1] - prev_obs.col)
+                        dyn_obs.append(DummyObs(d_idx, dr, dc))
+                    
+                    env.prev_dynamic_obstacles = old_dyn_obs  # Gerçek önceki konumlar
+                    env.dynamic_obstacles = dyn_obs           # Gerçek yeni konumlar
+
+                # Geçiş çarpışması denetimi için ajanın mevcut konumunu yedekle
+                prev_agent_pos = (env.agent_pos[0], env.agent_pos[1])
+
+                # Durum vektörü ve Inference (Model tipine göre)
+                if IS_PPO:
+                    state = get_ppo_observation(env)
+                    # PPO logits'i alıp frontend Q-değerleri olarak gönderelim
+                    state_t = torch.FloatTensor(state).unsqueeze(0)
+                    with torch.no_grad():
+                        logits = agent.policy(state_t).squeeze(0).numpy()
+                    
+                    # PPO: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=STAY
+                    # FE:  0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=STAY (Birebir 1-to-1 uyum!)
+                    ppo_action = int(np.argmax(logits))
+                    action = ppo_action
+
+                    # --- GÜVENLİK KALKANI (COLLISION AVOIDANCE SHIELD) ---
+                    # Eğer ajan statik bir duvara veya sınır dışına çarpmak üzereyse
+                    # beyninin karar verdiği en yüksek logitli GÜVENLİ alternatife yönlendirilir.
+                    DELTA_MAP = {0: (0,-1), 1: (0,1), 2: (-1,0), 3: (1,0)}
+                    next_pos = None
+                    if action in DELTA_MAP:
+                        dr, dc = DELTA_MAP[action]
+                        next_pos = (env.agent_pos[0] + dr, env.agent_pos[1] + dc)
+                    
+                    if next_pos is not None and (
+                        not (0 <= next_pos[0] < env.size and 0 <= next_pos[1] < env.size)
+                        or env.grid[next_pos[0], next_pos[1]] == 1
+                    ):
+                        safe_actions = []
+                        for a in range(5):
+                            if a == 4:
+                                safe_actions.append(a)
+                            elif a in DELTA_MAP:
+                                cdr, cdc = DELTA_MAP[a]
+                                c_pos = (env.agent_pos[0] + cdr, env.agent_pos[1] + cdc)
+                                if (0 <= c_pos[0] < env.size and 0 <= c_pos[1] < env.size) and env.grid[c_pos[0], c_pos[1]] != 1:
+                                    safe_actions.append(a)
+                        if safe_actions:
+                            action = int(max(safe_actions, key=lambda a: logits[a]))
+                            ppo_action = action
+                    
+                    # Update PPO action history
+                    action_oh = [0.0]*5
+                    action_oh[ppo_action] = 1.0
+                    env.action_history.append(action_oh)
+                    
+                    # Q-values representation for frontend
+                    q_values = [
+                        float(logits[0]),  # LEFT
+                        float(logits[1]),  # RIGHT
+                        float(logits[2]),  # UP
+                        float(logits[3]),  # DOWN
+                    ]
+                    
+                    # Simülasyon adımı
+                    if action == 4:  # STAY
+                        reward = -0.05
+                        env.steps_taken += 1
+                        done = env.steps_taken >= env.max_steps
+                        info = {"reached_goal": False, "steps": env.steps_taken}
+                    else:
+                        _, reward, done, info = env.step(action)
+                    
+                    epsilon = 0.0  # PPO deterministik çalışıyor
+                    episode = 1
                 else:
-                    state = env._get_state()
+                    if tick.get("state") is not None:
+                        state = np.array(tick["state"], dtype=np.float32)[:16]
+                    else:
+                        state = env._get_state()[:16]
+                        
+                    q_values = agent.get_q_values(state)
+                    DELTA_MAP = {0: (0,-1), 1: (0,1), 2: (-1,0), 3: (1,0)}
+                    
+                    # Salınım tespiti: son 6 adımda ≤2 unique pozisyon
+                    oscillating = (
+                        len(pos_history) >= 6
+                        and len(set(list(pos_history)[-6:])) <= 2
+                    )
+                    
+                    if oscillating:
+                        recent = set(list(pos_history)[-4:])
+                        escape = [a for a in range(4)
+                                  if tuple(np.array(env.agent_pos) + np.array(DELTA_MAP[a])) not in recent]
+                        candidates = escape if escape else list(range(4))
+                        action = int(max(candidates, key=lambda a: q_values[a]))
+                    else:
+                        action = int(np.argmax(q_values))
+                        
+                    _, reward, done, info = env.step(action)
+                    epsilon = round(float(agent.epsilon), 4)
+                    episode = int(agent.episode_count)
 
-                # Inference
-                q_values = agent.get_q_values(state)
-                DELTA_MAP = {0: (0,-1), 1: (0,1), 2: (-1,0), 3: (1,0)}
+                # ─── GEÇİŞ ÇARPIŞMASI (SWAP COLLISION) KONTROLÜ ───
+                # Eğer ajan ve herhangi bir hareketli engel hücre değiştirdiyse (birbirinin içinden geçtiyse)
+                # bu durum da çarpışmadır ve simülasyon sonlandırılmalıdır!
+                swap_hit = False
+                new_agent_pos = (env.agent_pos[0], env.agent_pos[1])
+                if not done:
+                    for idx, obs in enumerate(env.dynamic_obstacles):
+                        if idx < len(env.prev_dynamic_obstacles):
+                            prev_obs = env.prev_dynamic_obstacles[idx]
+                            prev_obs_pos = (prev_obs.row, prev_obs.col)
+                            new_obs_pos = (obs.row, obs.col)
+                            
+                            # Eğer ajan engelin eski yerine, engel de ajanın eski yerine geldiyse
+                            if prev_agent_pos == new_obs_pos and new_agent_pos == prev_obs_pos:
+                                swap_hit = True
+                                print(f"[COLLISION] Geçiş (Swap) Çarpışması! Ajan: {prev_agent_pos}->{new_agent_pos} | Engel: {prev_obs_pos}->{new_obs_pos}")
+                                done = True
+                                reward = -50.0
+                                info = {"reached_goal": False, "status": "hit_obstacle", "steps": env.steps_taken}
+                                break
 
-                def is_safe(a):
-                    dr, dc = DELTA_MAP[a]
-                    nr, nc = env.agent_pos[0]+dr, env.agent_pos[1]+dc
-                    return (0 <= nr < env.size and 0 <= nc < env.size
-                            and env.grid[nr, nc] != 1)
+                # Hareketli engel ajanın üzerine mi geldi? (Pasif veya Geçiş Çarpışması)
+                if swap_hit or (env._is_blocked(env.agent_pos[0], env.agent_pos[1]) and env.grid[env.agent_pos[0], env.agent_pos[1]] != 1):
+                    # Hareketli engel ajanı ezdi!
+                    r, c = env.agent_pos
+                    half = env.size // 2
+                    await ws.send_json({
+                        "action": 0, "action_label": "HIT", "q_values": [0,0,0,0],
+                        "reward": -50.0, "done": True, "reached_goal": False, "stuck": False,
+                        "agent_pos": {"x": int(c - half), "y": int(half - r)}
+                    })
+                    pos_history.clear()
+                    env.reset()
+                    if IS_PPO:
+                        if hasattr(env, "visit_map"): delattr(env, "visit_map")
+                        if hasattr(env, "action_history"): delattr(env, "action_history")
+                    continue
 
-                # Duvar/engele çarpmayan aksiyonlar
-                safe_actions = [a for a in range(4) if is_safe(a)]
-
-                # Salınım tespiti: son 6 adımda ≤2 unique pozisyon
-                oscillating = (
-                    len(pos_history) >= 6
-                    and len(set(list(pos_history)[-6:])) <= 2
-                )
-
-                if oscillating and safe_actions:
-                    # Son 4 adımda ziyaret edilmemiş güvenli aksiyonlar tercih edilir
-                    recent = set(list(pos_history)[-4:])
-                    escape = [a for a in safe_actions
-                              if tuple(np.array(env.agent_pos) + np.array(DELTA_MAP[a])) not in recent]
-                    candidates = escape if escape else safe_actions
-                    action = max(candidates, key=lambda a: q_values[a])
-                    print(f"[WS] ESCAPE: osc={oscillating}, action={action}")
-                elif safe_actions:
-                    # Normal: güvenli aksiyonlar arasında en yüksek Q
-                    action = max(safe_actions, key=lambda a: q_values[a])
-                else:
-                    # Her yön engelli/duvar — episode bitir
-                    action = int(np.argmax(q_values))
-
-                # Simülasyonu ilerlet
-                _, reward, done, info = env.step(action)
+                # Ziyaret haritasını güncelle (PPO)
+                if IS_PPO:
+                    if not hasattr(env, "visit_map"):
+                        env.visit_map = np.zeros((env.size, env.size), dtype=np.float32)
+                    env.visit_map[env.agent_pos[0], env.agent_pos[1]] += 1.0
 
                 # Kartezyen koordinata dönüştür (frontend için)
                 r, c = env.agent_pos
@@ -479,26 +706,30 @@ async def ws_simulate(ws: WebSocket):
                 agent_y = int(half - r)
                 pos_history.append((r, c))
 
-                action_labels = ["LEFT", "RIGHT", "UP", "DOWN"]
-                print(f"[SIM] Step {env.steps_taken}: Cart({agent_x},{agent_y}) | {action_labels[action]} | Q=[{q_values[0]:.2f},{q_values[1]:.2f},{q_values[2]:.2f},{q_values[3]:.2f}] | osc={oscillating}")
+                action_labels = {0: "LEFT", 1: "RIGHT", 2: "UP", 3: "DOWN", 4: "STAY"}
+                print(f"[SIM] Step {env.steps_taken}: Cart({agent_x},{agent_y}) | {action_labels.get(action, 'UNKNOWN')} | Q={[round(x, 2) for x in q_values[:4]]}")
+                
                 response = {
                     "action": int(action),
-                    "action_label": str(ACTION_LABELS[action]),
+                    "action_label": action_labels.get(action, "UNKNOWN"),
                     "q_values": [round(float(v), 4) for v in q_values],
                     "reward": round(float(reward), 2),
                     "done": bool(done),
                     "reached_goal": bool(info["reached_goal"]),
                     "stuck": bool(info.get("stuck", False)),
-                    "epsilon": round(float(agent.epsilon), 4),
-                    "episode": int(agent.episode_count),
+                    "epsilon": epsilon,
+                    "episode": episode,
                     "agent_pos": {"x": agent_x, "y": agent_y},
-                    "steps": int(info["steps"]),
+                    "steps": int(info.get("steps", env.steps_taken)),
                 }
                 await ws.send_json(response)
 
                 if done:
                     pos_history.clear()
                     env.reset()
+                    if IS_PPO:
+                        if hasattr(env, "visit_map"): delattr(env, "visit_map")
+                        if hasattr(env, "action_history"): delattr(env, "action_history")
             except Exception as proc_err:
                 print(f"[WS] İşlem hatası: {proc_err}")
                 import traceback

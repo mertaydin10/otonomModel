@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import numpy as np
 from collections import deque
-from typing import Optional
+from typing import Optional, List
 
 # ─── Aksiyon sabitleri (Spring Boot uyumlu) ──────────────────────────────────
 ACTION_LEFT  = 0   # ←
@@ -48,6 +48,52 @@ ACTION_LABELS = {
 }
 
 
+# ─── Dinamik Engel ──────────────────────────────────────────────────────────
+
+class DynamicObstacle:
+    """
+    Hareketli engel — patrol (devriye) modunda hareket eder.
+    Duvara veya statik engele çarpınca yön tersler (bounce).
+    """
+    __slots__ = ("row", "col", "dr", "dc", "size")
+
+    def __init__(self, row: int, col: int, dr: int, dc: int, size: int):
+        self.row = row
+        self.col = col
+        self.dr = dr      # satır hareket yönü (-1, 0, +1)
+        self.dc = dc      # sütun hareket yönü (-1, 0, +1)
+        self.size = size
+
+    @property
+    def pos(self) -> tuple:
+        return (self.row, self.col)
+
+    def move(self, static_grid: np.ndarray, occupied: set) -> None:
+        """
+        Bir adım ilerle. Eğer hedef hücre duvar, statik engel,
+        sınır dışı veya başka bir dinamik engel tarafından tutuluyorsa
+        yönü tersle (bounce) ve bir adım daha dene.
+        İki denemede de hareket edemezse yerinde kal.
+        """
+        for attempt in range(2):
+            nr = self.row + self.dr
+            nc = self.col + self.dc
+            if (0 <= nr < self.size and 0 <= nc < self.size
+                    and static_grid[nr, nc] == 0
+                    and (nr, nc) not in occupied):
+                occupied.discard((self.row, self.col))
+                self.row = nr
+                self.col = nc
+                occupied.add((self.row, self.col))
+                return
+            # Bounce — yönü tersle
+            self.dr = -self.dr
+            self.dc = -self.dc
+
+    def __repr__(self) -> str:
+        return f"DynObs({self.row},{self.col} dir=({self.dr},{self.dc}))"
+
+
 class GridEnvironment:
     """
     Grid World ortamı — DQL ajan eğitimi için.
@@ -67,12 +113,18 @@ class GridEnvironment:
         max_steps: int = 500,
         random_maps: bool = True,
         min_path_length: int = 0,
+        dynamic_obstacle_count: int = 0,
+        dynamic_move_interval: int = 1,
+        state_size: int = 12,
     ):
         self.size = size
         self.obstacle_ratio = obstacle_ratio
         self.max_steps = max_steps
         self.random_maps = random_maps
         self.min_path_length = min_path_length
+
+        self.dynamic_obstacle_count = dynamic_obstacle_count
+        self.dynamic_move_interval = dynamic_move_interval
 
         self.grid = np.zeros((size, size), dtype=np.int8)
         self.start_pos = (0, 0)
@@ -81,20 +133,14 @@ class GridEnvironment:
         self.steps_taken = 0
         self._prev_dist: float = 0.0
 
-<<<<<<< Updated upstream
-        self.state_size = 12   # Spring Boot Normalizer ile uyumlu
-=======
         # Dinamik engel listesi
         self.dynamic_obstacles: List[DynamicObstacle] = []
 
         # API'den yüklenen engeller için — reset sırasında overwrite etmeyin
         self.api_loaded_obstacles: bool = False
 
-        # State boyutu: 12 (statik) — trained model ile uyumlu
-        # NOT: Dinamik engel özellikleri (4 eleman) henüz state'e entegre değil.
-        # Gelecekte state_size=16 için yeni model eğitilmeli.
-        self.state_size = 12
->>>>>>> Stashed changes
+        # State boyutu: 12 (statik) veya 16 (dinamik engelli)
+        self.state_size = state_size
         self.action_size = 4
 
         if self.random_maps:
@@ -226,8 +272,6 @@ class GridEnvironment:
 
         self._generate_from_data(grid, start, goal)
 
-<<<<<<< Updated upstream
-=======
     def load_dynamic_obstacles_from_api(self, obstacles_list: list) -> None:
         """
         API'dan gelen dinamik engel listesini yükler.
@@ -354,8 +398,6 @@ class GridEnvironment:
     def _get_dynamic_positions(self) -> set:
         """Dinamik engel pozisyonları kümesi."""
         return {obs.pos for obs in self.dynamic_obstacles}
-
->>>>>>> Stashed changes
     # ─── Ortam API ────────────────────────────────────────────────────────────
 
     def reset(
@@ -390,13 +432,9 @@ class GridEnvironment:
         )
         self._visited: dict = {self.start_pos: 1}  # hücre → ziyaret sayısı
 
-<<<<<<< Updated upstream
-=======
         # Dinamik engelleri yeniden oluştur (API'den yüklenmişse yapma)
         if not self.api_loaded_obstacles:
             self._spawn_dynamic_obstacles()
-
->>>>>>> Stashed changes
     def step(self, action: int) -> tuple:
         """
         Ajan bir adım atar.
@@ -419,8 +457,9 @@ class GridEnvironment:
             info["status"] = "out_of_bounds"
             return self._get_state(), -10.0, True, info
 
-        # Engel çarpması
-        if self.grid[nr, nc] == 1:
+        # Engel çarpması (Statik veya Dinamik)
+        if self._is_blocked(nr, nc):
+            self.agent_pos = (nr, nc)  # Frontend'in çarpışmayı çizmesi için konumu güncelle
             info["status"] = "hit_obstacle"
             return self._get_state(), -50.0, True, info
 
@@ -461,13 +500,6 @@ class GridEnvironment:
 
     def _get_state(self) -> np.ndarray:
         """
-<<<<<<< Updated upstream
-        12-boyutlu durum vektörü üretir (Spring Boot Normalizer ile uyumlu).
-
-        [0..3]  Normalize pozisyonlar (agent_col, agent_row, goal_col, goal_row)
-        [4..7]  Anlık engel sensörleri (LEFT, RIGHT, UP, DOWN)
-        [8..11] Yön bazlı engel mesafeleri normalize (LEFT, RIGHT, UP, DOWN)
-=======
         Durum vektörü üretir.
 
         v2 (12 eleman):
@@ -477,7 +509,6 @@ class GridEnvironment:
 
         v3 (16 eleman) — gelecek için:
           [12..15] En yakın dinamik engel bilgisi
->>>>>>> Stashed changes
         """
         s = max(self.size - 1, 1)
         row, col = self.agent_pos
@@ -491,7 +522,7 @@ class GridEnvironment:
             nr, nc = row + dr, col + dc
 
             # Anlık sensör
-            if not (0 <= nr < self.size and 0 <= nc < self.size) or self.grid[nr, nc] == 1:
+            if not (0 <= nr < self.size and 0 <= nc < self.size) or self._is_blocked(nr, nc):
                 imm[act] = 1.0
 
             # Mesafe sensörü (ışın atışı)
@@ -502,18 +533,10 @@ class GridEnvironment:
                 if not (0 <= r < self.size and 0 <= c < self.size):
                     break
                 d += 1
-                if self.grid[r, c] == 1:
+                if self._is_blocked(r, c):
                     break
             dist[act] = d / s
 
-<<<<<<< Updated upstream
-        state = np.array([
-            col / s, row / s,           # ajan x, y
-            gcol / s, grow / s,         # hedef x, y
-            imm[0], imm[1], imm[2], imm[3],
-            dist[0], dist[1], dist[2], dist[3],
-        ], dtype=np.float32)
-=======
         # v2 uyumlu 12-eleman state (trained model ile çalışır)
         if self.state_size == 12:
             state = np.array([
@@ -552,7 +575,6 @@ class GridEnvironment:
                 nearest_dx, nearest_dy,     # en yakın dinamik engel göreceli pozisyon
                 nearest_move_dx, nearest_move_dy,  # en yakın dinamik engel hareket yönü
             ], dtype=np.float32)
->>>>>>> Stashed changes
 
         return state
 

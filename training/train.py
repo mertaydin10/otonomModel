@@ -119,13 +119,9 @@ def train(config: dict, resume: bool = False) -> None:
         random_maps      = config["random_maps"],
     )
 
-<<<<<<< Updated upstream
-=======
     # v2 training: use 12-element state (no dynamic obstacles)
     # Environment produces 16-element state but last 4 will be zero (dyn=0)
     v2_state_size = 12
-
->>>>>>> Stashed changes
     agent = DQLAgent(
         state_size      = env.state_size,
         action_size     = env.action_size,
@@ -191,11 +187,7 @@ def train(config: dict, resume: bool = False) -> None:
                   f"min yol {cur_mpl} adim  "
                   f"(basari: {float(np.mean(success_window)):.1%})")
 
-<<<<<<< Updated upstream
-        state        = env.reset()
-=======
         state        = env.reset()[:v2_state_size]  # 16->12 slice (v2 compat)
->>>>>>> Stashed changes
         total_reward = 0.0
         ep_losses    = []
         done         = False
@@ -204,14 +196,9 @@ def train(config: dict, resume: bool = False) -> None:
             # Select action
             action = agent.select_action(state, training=True)
 
-<<<<<<< Updated upstream
-            # Adımı at
-            next_state, reward, done, info = env.step(action)
-=======
             # Step
             next_state_full, reward, done, info = env.step(action)
             next_state = next_state_full[:v2_state_size]  # 16->12
->>>>>>> Stashed changes
 
             # Remember experience
             agent.remember(state, action, reward, next_state, done)
