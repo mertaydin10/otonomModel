@@ -74,31 +74,50 @@ import torch
 from agent.ppo_agent import PPOAgent
 from collections import deque
 
+# ─── Model Yükleme ve Konfigürasyon ───
 MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "ppo_stage_4_hardcore"
+    os.path.dirname(os.path.dirname(__file__)), "models", "best_model_v4.pth"
 )
-DEFAULT_SIZE = 20  # PPO hardcore model 20x20 veya 25x25 gridler için optimize edilmiş durumda
+DEFAULT_SIZE = 15  # best_model_v4 genelde 15x15 için eğitildi
 
-# Model tipini otomatik tespit et
+# PPO mu yoksa DQN mu otomatik olarak tespit et ve yükle
 IS_PPO = os.path.exists(os.path.join(MODEL_PATH, "policy.pth")) or "ppo" in MODEL_PATH.lower()
 
 if IS_PPO:
     print(f"[INIT] PPO Hardcore Model tespit edildi! Model: {MODEL_PATH}")
     env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=102)
     agent = PPOAgent(state_size=102, action_size=5)
+    try:
+        agent.load(MODEL_PATH)
+    except Exception as _load_err:
+        print(f"[WARN] PPO model yüklenemedi: {_load_err}")
 else:
-    print(f"[INIT] DQN Model tespit edildi! Model: {MODEL_PATH}")
-    env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=16)
+    print(f"[INIT] DQN Model yükleniyor: {MODEL_PATH}")
+    # Checkpoint'i yükleyip içindeki gizli katman ve durum vektörü boyutlarını dinamik oku
+    state_size = 16  # Varsayılan
+    hidden_size = 256  # Varsayılan
+    action_size = 4  # Varsayılan
+    
+    try:
+        checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+        if "config" in checkpoint:
+            state_size = checkpoint["config"].get("state_size", state_size)
+            hidden_size = checkpoint["config"].get("hidden_size", hidden_size)
+            action_size = checkpoint["config"].get("action_size", action_size)
+            print(f"[INIT] Checkpoint konfigürasyonu okundu: state_size={state_size}, hidden_size={hidden_size}, action_size={action_size}")
+    except Exception as _read_err:
+        print(f"[WARN] Checkpoint okunamadı, varsayılan boyutlar kullanılacak: {_read_err}")
+        
+    env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=state_size)
     agent = DQLAgent(
-        state_size=16,
-        action_size=env.action_size,
-        hidden_size=256
+        state_size=state_size,
+        action_size=action_size,
+        hidden_size=hidden_size
     )
-
-try:
-    agent.load(MODEL_PATH)
-except Exception as _load_err:
-    print(f"[WARN] Model yüklenemedi, yeni ağırlıklarla başlanıyor: {_load_err}")
+    try:
+        agent.load(MODEL_PATH)
+    except Exception as _load_err:
+        print(f"[WARN] DQN model yüklenemedi, yeni ağırlıklarla başlanıyor: {_load_err}")
 
 training_state: Dict[str, Any] = {
     "running": False,
@@ -124,6 +143,10 @@ class TrainRequest(BaseModel):
 
 class InferRequest(BaseModel):
     state: list[float]
+
+
+class SelectModelRequest(BaseModel):
+    model_key: str
 
 
 class DynamicObstacleDTO(BaseModel):
@@ -162,6 +185,91 @@ async def health():
     }
 
 
+@app.get("/models")
+async def get_models():
+    """Mevcut tüm otonom sürüş modellerini ve aktif olanı listele."""
+    # Models klasöründeki tüm pth dosyalarını listele
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    models_dir = os.path.join(project_root, "models")
+    
+    available_models = [
+        {"key": "ppo_stage_4_hardcore", "name": "PPO (ppo_stage_4_hardcore)", "type": "PPO"}
+    ]
+    
+    if os.path.exists(models_dir):
+        for f in os.listdir(models_dir):
+            if f.endswith(".pth"):
+                key = f.replace(".pth", "")
+                name = f"DQN ({key})"
+                available_models.append({"key": key, "name": name, "type": "DQN"})
+                
+    # Aktif model ismini bul
+    active_key = os.path.basename(MODEL_PATH).replace(".pth", "")
+    if "ppo_stage_4" in MODEL_PATH:
+        active_key = "ppo_stage_4_hardcore"
+        
+    return {
+        "models": available_models,
+        "active_model": active_key
+    }
+
+
+@app.post("/model/select")
+async def select_model(req: SelectModelRequest):
+    """Canlı olarak otonom sürüş modelini değiştir."""
+    global MODEL_PATH, IS_PPO, env, agent
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        if req.model_key == "ppo_stage_4_hardcore":
+            new_path = os.path.join(os.path.dirname(project_root), "ppo_stage_4_hardcore")
+        else:
+            new_path = os.path.join(project_root, "models", f"{req.model_key}.pth")
+            
+        if not os.path.exists(new_path):
+            raise HTTPException(status_code=404, detail=f"Model dosyası bulunamadı: {new_path}")
+            
+        MODEL_PATH = new_path
+        IS_PPO = os.path.exists(os.path.join(MODEL_PATH, "policy.pth")) or "ppo" in MODEL_PATH.lower()
+        
+        if IS_PPO:
+            print(f"[DYNAMIC CHANGE] PPO modeline geçiliyor: {MODEL_PATH}")
+            env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=102)
+            agent = PPOAgent(state_size=102, action_size=5)
+            agent.load(MODEL_PATH)
+        else:
+            print(f"[DYNAMIC CHANGE] DQN modeline geçiliyor: {MODEL_PATH}")
+            state_size = 16
+            hidden_size = 256
+            action_size = 4
+            
+            checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+            if "config" in checkpoint:
+                state_size = checkpoint["config"].get("state_size", state_size)
+                hidden_size = checkpoint["config"].get("hidden_size", hidden_size)
+                action_size = checkpoint["config"].get("action_size", action_size)
+                
+            env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=state_size)
+            agent = DQLAgent(
+                state_size=state_size,
+                action_size=action_size,
+                hidden_size=hidden_size
+            )
+            agent.load(MODEL_PATH)
+            
+        print(f"[DYNAMIC CHANGE] Model değişimi başarılı! Aktif model: {req.model_key}")
+        return {
+            "status": "success",
+            "active_model": req.model_key,
+            "type": "PPO" if IS_PPO else "DQN",
+            "state_size": env.state_size
+        }
+    except Exception as err:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Model yüklenemedi: {str(err)}")
+
+
 @app.post("/maps/load")
 async def load_map(payload: MapPayload):
     """Frontend'den gelen harita + dinamik engelleri yükle."""
@@ -173,7 +281,7 @@ async def load_map(payload: MapPayload):
 
         # Fresh GridEnvironment instance
         size = payload_dict["grid_size"]["x"]
-        env = GridEnvironment(size=size, random_maps=False, state_size=16)
+        env = GridEnvironment(size=size, random_maps=False, state_size=agent.state_size)
 
         # Harita yükle — inline implementation
         half = size // 2
@@ -629,9 +737,9 @@ async def ws_simulate(ws: WebSocket):
                     episode = 1
                 else:
                     if tick.get("state") is not None:
-                        state = np.array(tick["state"], dtype=np.float32)[:16]
+                        state = np.array(tick["state"], dtype=np.float32)[:agent.state_size]
                     else:
-                        state = env._get_state()[:16]
+                        state = env._get_state()[:agent.state_size]
                         
                     q_values = agent.get_q_values(state)
                     DELTA_MAP = {0: (0,-1), 1: (0,1), 2: (-1,0), 3: (1,0)}
