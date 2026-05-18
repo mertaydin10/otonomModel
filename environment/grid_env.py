@@ -225,16 +225,12 @@ class GridEnvironment:
     ) -> None:
         """
         Dışarıdan verilmiş grid matrisi ve konum bilgisiyle haritayı ayarlar.
-        Harita geçersizse (çözümsüz) random haritaya geri döner.
         """
-        if self._is_solvable(grid, start, goal):
-            self.grid = grid.copy()
-            self.start_pos = tuple(start)
-            self.goal_pos = tuple(goal)
-            self.size = grid.shape[0]
-            self.api_loaded_obstacles = False  # Yeni harita → normal spawn davranışı
-        else:
-            self._generate_random_map()
+        self.grid = grid.copy()
+        self.start_pos = tuple(start)
+        self.goal_pos = tuple(goal)
+        self.size = grid.shape[0]
+        self.api_loaded_obstacles = False  # Yeni harita → normal spawn davranışı
 
     def load_from_api_payload(self, payload: dict) -> None:
         """

@@ -619,24 +619,39 @@ async def ws_simulate(ws: WebSocket):
                     grid_arr = np.array(tick["grid"], dtype=np.int8)
                     size = grid_arr.shape[0]
                     half = size // 2
-
+ 
                     def api_to_idx(x: int, y: int) -> tuple:
                         return (half - y, x + half)
-
+ 
                     sp = tick.get("agent_pos", {"x": -half, "y": half})
                     gp = tick.get("goal_pos", {"x": half, "y": -half})
                     start = api_to_idx(sp["x"], sp["y"])
                     goal = api_to_idx(gp["x"], gp["y"])
-
-                    env._generate_from_data(grid_arr, start, goal)
-                    # Agent'ı başlangıç konumuna reset et
-                    env.agent_pos = start
-                    env.steps_taken = 0
-                    env._prev_dist = float(abs(start[0] - goal[0]) + abs(start[1] - goal[1]))
-                    env._visited = {start: 1}
-                    if IS_PPO:
-                        if hasattr(env, "visit_map"): delattr(env, "visit_map")
-                        if hasattr(env, "action_history"): delattr(env, "action_history")
+ 
+                    # Simülasyonun ilk adımı mı yoksa devam eden adım mı olduğunu belirle
+                    # Eğer adımlar sıfırsa veya frontend is_first_tick göndermişse tam reset yap
+                    is_first_tick = tick.get("is_first_tick", False) or (env.steps_taken == 0)
+ 
+                    if is_first_tick:
+                        # İlk adımda harita bütünlüğünü ve çözülebilirliği kontrol et
+                        env._generate_from_data(grid_arr, start, goal)
+                        env.agent_pos = start
+                        env.steps_taken = 0
+                        env._prev_dist = float(abs(start[0] - goal[0]) + abs(start[1] - goal[1]))
+                        env._visited = {start: 1}
+                        if IS_PPO:
+                            if hasattr(env, "visit_map"): delattr(env, "visit_map")
+                            if hasattr(env, "action_history"): delattr(env, "action_history")
+                    else:
+                        # Devam eden adımlarda (örneğin trafik ışığı değiştiğinde) 
+                        # beynin geçmişini ve adımlarını koru, sadece ızgarayı ve ajanın anlık konumunu güncelle
+                        env.grid = grid_arr.copy()
+                        env.goal_pos = goal
+                        env.agent_pos = start
+                        
+                        # Hata ayıklama için kırmızı ışık koordinatlarını loglayalım
+                        red_lights = np.argwhere(env.grid == 1)
+                        print(f"[DEBUG_LIGHT] Adım: {env.steps_taken} | Ajan: {env.agent_pos} | Kırmızı Işıklar (row,col): {list(map(tuple, red_lights))}")
 
                 # Hareketli engellerin senkronizasyonu
                 if tick.get("dynamic_obstacles") is not None:
