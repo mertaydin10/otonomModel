@@ -76,12 +76,27 @@ from collections import deque
 
 # ─── Model Yükleme ve Konfigürasyon ───
 MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "models", "best_model_v4.pth"
+    os.path.dirname(os.path.dirname(__file__)), "models", "ppo_sweetspot_3"
 )
-DEFAULT_SIZE = 15  # best_model_v4 genelde 15x15 için eğitildi
+DEFAULT_SIZE = 15  # Sweet Spot 3 — tüm grid boyutlarında şampiyon
 
 # PPO mu yoksa DQN mu otomatik olarak tespit et ve yükle
 IS_PPO = os.path.exists(os.path.join(MODEL_PATH, "policy.pth")) or "ppo" in MODEL_PATH.lower()
+
+# Dynamic view radius mapping for different PPO models
+def get_model_view_radius(model_path: str) -> int:
+    lower_path = model_path.lower()
+    if any(x in lower_path for x in ["radius3", "radius_3", "_r3", "sweetspot3"]):
+        return 3
+    elif any(x in lower_path for x in ["radius4", "radius_4", "_r4", "sweetspot"]):
+        return 4
+    elif any(x in lower_path for x in ["radius5", "radius_5", "_r5", "sweetspot5"]):
+        return 5
+    elif any(x in lower_path for x in ["radius6", "radius_6", "_r6", "sweetspot6"]):
+        return 6
+    return 7
+
+PPO_VIEW_RADIUS = get_model_view_radius(MODEL_PATH)
 
 if IS_PPO:
     print(f"[INIT] PPO Hardcore Model tespit edildi! Model: {MODEL_PATH}")
@@ -192,22 +207,27 @@ async def get_models():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     models_dir = os.path.join(project_root, "models")
     
-    available_models = [
-        {"key": "ppo_stage_4_hardcore", "name": "PPO (ppo_stage_4_hardcore)", "type": "PPO"}
-    ]
+    available_models = []
     
     if os.path.exists(models_dir):
         for f in os.listdir(models_dir):
-            if f.endswith(".pth"):
+            full_path = os.path.join(models_dir, f)
+            if os.path.isdir(full_path):
+                # PPO model folders contain policy.pth
+                if os.path.exists(os.path.join(full_path, "policy.pth")):
+                    available_models.append({"key": f, "name": f"PPO ({f})", "type": "PPO"})
+            elif f.endswith(".pth"):
                 key = f.replace(".pth", "")
                 name = f"DQN ({key})"
                 available_models.append({"key": key, "name": name, "type": "DQN"})
                 
+    # Eger hic PPO model tespit edilemediyse varsayilan olarak listele
+    if not any(m["type"] == "PPO" for m in available_models):
+        available_models.insert(0, {"key": "ppo_stage_4_hardcore", "name": "PPO (ppo_stage_4_hardcore)", "type": "PPO"})
+        
     # Aktif model ismini bul
     active_key = os.path.basename(MODEL_PATH).replace(".pth", "")
-    if "ppo_stage_4" in MODEL_PATH:
-        active_key = "ppo_stage_4_hardcore"
-        
+    
     return {
         "models": available_models,
         "active_model": active_key
@@ -217,12 +237,13 @@ async def get_models():
 @app.post("/model/select")
 async def select_model(req: SelectModelRequest):
     """Canlı olarak otonom sürüş modelini değiştir."""
-    global MODEL_PATH, IS_PPO, env, agent
+    global MODEL_PATH, IS_PPO, env, agent, PPO_VIEW_RADIUS
     try:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
-        if req.model_key == "ppo_stage_4_hardcore":
-            new_path = os.path.join(project_root, "models", "ppo_stage_4_hardcore")
+        folder_path = os.path.join(project_root, "models", req.model_key)
+        if os.path.isdir(folder_path):
+            new_path = folder_path
         else:
             new_path = os.path.join(project_root, "models", f"{req.model_key}.pth")
             
@@ -233,7 +254,8 @@ async def select_model(req: SelectModelRequest):
         IS_PPO = os.path.exists(os.path.join(MODEL_PATH, "policy.pth")) or "ppo" in MODEL_PATH.lower()
         
         if IS_PPO:
-            print(f"[DYNAMIC CHANGE] PPO modeline geçiliyor: {MODEL_PATH}")
+            PPO_VIEW_RADIUS = get_model_view_radius(MODEL_PATH)
+            print(f"[DYNAMIC CHANGE] PPO modeline geçiliyor: {MODEL_PATH} (View Radius: {PPO_VIEW_RADIUS})")
             env = GridEnvironment(size=DEFAULT_SIZE, random_maps=True, state_size=102)
             agent = PPOAgent(state_size=102, action_size=5)
             agent.load(MODEL_PATH)
@@ -648,10 +670,10 @@ async def ws_simulate(ws: WebSocket):
                         env.grid = grid_arr.copy()
                         env.goal_pos = goal
                         env.agent_pos = start
-                        
-                        # Hata ayıklama için kırmızı ışık koordinatlarını loglayalım
-                        red_lights = np.argwhere(env.grid == 1)
-                        print(f"[DEBUG_LIGHT] Adım: {env.steps_taken} | Ajan: {env.agent_pos} | Kırmızı Işıklar (row,col): {list(map(tuple, red_lights))}")
+                        # Hata ayıklama için statik engellerin (binaların) koordinatlarını loglayalım
+                        obstacles = np.argwhere(env.grid == 1)
+                        # Sadece çok uzun olmaması için engellerin toplam sayısını yazdıralım
+                        print(f"[DEBUG] Adım: {env.steps_taken} | Ajan: {env.agent_pos} | Haritadaki Statik Engel (Bina) Sayısı: {len(obstacles)}")
 
                 # Hareketli engellerin senkronizasyonu
                 if tick.get("dynamic_obstacles") is not None:
@@ -689,49 +711,60 @@ async def ws_simulate(ws: WebSocket):
 
                 # Durum vektörü ve Inference (Model tipine göre)
                 if IS_PPO:
-                    state = get_ppo_observation(env)
+                    state = get_ppo_observation(env, view_radius=PPO_VIEW_RADIUS)
                     # PPO logits'i alıp frontend Q-değerleri olarak gönderelim
                     state_t = torch.FloatTensor(state).unsqueeze(0)
                     with torch.no_grad():
                         logits = agent.policy(state_t).squeeze(0).numpy()
                     
-                    # PPO: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=STAY
-                    # FE:  0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=STAY (Birebir 1-to-1 uyum!)
                     ppo_action = int(np.argmax(logits))
                     action = ppo_action
 
                     # --- GÜVENLİK KALKANI (COLLISION AVOIDANCE SHIELD) ---
-                    # Eğer ajan statik bir duvara veya sınır dışına çarpmak üzereyse
+                    # Eğer ajan statik bir duvara, kırmızı ışığa veya dinamik engele çarpmak üzereyse
                     # beyninin karar verdiği en yüksek logitli GÜVENLİ alternatife yönlendirilir.
+                    # Actions: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, 4=STAY
                     DELTA_MAP = {0: (0,-1), 1: (0,1), 2: (-1,0), 3: (1,0)}
-                    next_pos = None
-                    if action in DELTA_MAP:
-                        dr, dc = DELTA_MAP[action]
-                        next_pos = (env.agent_pos[0] + dr, env.agent_pos[1] + dc)
                     
-                    if next_pos is not None and (
-                        not (0 <= next_pos[0] < env.size and 0 <= next_pos[1] < env.size)
-                        or env.grid[next_pos[0], next_pos[1]] == 1
-                    ):
-                        safe_actions = []
-                        for a in range(5):
-                            if a == 4:
+                    # Güvenli eylemleri kontrol edelim (Statik engeller, Kırmızı Işıklar ve Hareketli Engeller)
+                    safe_actions = []
+                    for a in range(4):
+                        dr, dc = DELTA_MAP[a]
+                        c_pos = (env.agent_pos[0] + dr, env.agent_pos[1] + dc)
+                        if (0 <= c_pos[0] < env.size and 0 <= c_pos[1] < env.size):
+                            # 1. Statik engeller ve kırmızı ışıklar
+                            if env.grid[c_pos[0], c_pos[1]] == 1:
+                                continue
+                            
+                            # 2. Hareketli engeller (Pasif ve Swap çarpışmaları)
+                            is_dyn_blocked = False
+                            if hasattr(env, "dynamic_obstacles"):
+                                for idx, obs in enumerate(env.dynamic_obstacles):
+                                    # Pasif çarpışma (engelin yeni/güncel konumu)
+                                    if (obs.row, obs.col) == c_pos:
+                                        is_dyn_blocked = True
+                                        break
+                                    # Swap çarpışması (ajan engelin eski konumuna, engel ajanın eski konumuna)
+                                    if hasattr(env, "prev_dynamic_obstacles") and idx < len(env.prev_dynamic_obstacles):
+                                        prev_obs = env.prev_dynamic_obstacles[idx]
+                                        if (prev_obs.row, prev_obs.col) == c_pos and (obs.row, obs.col) == env.agent_pos:
+                                            is_dyn_blocked = True
+                                            break
+                            
+                            if not is_dyn_blocked:
                                 safe_actions.append(a)
-                            elif a in DELTA_MAP:
-                                cdr, cdc = DELTA_MAP[a]
-                                c_pos = (env.agent_pos[0] + cdr, env.agent_pos[1] + cdc)
-                                if (0 <= c_pos[0] < env.size and 0 <= c_pos[1] < env.size) and env.grid[c_pos[0], c_pos[1]] != 1:
-                                    safe_actions.append(a)
-                        if safe_actions:
-                            action = int(max(safe_actions, key=lambda a: logits[a]))
-                            ppo_action = action
+                    safe_actions.append(4)  # STAY her zaman güvenlidir
                     
-                    # Update PPO action history
+                    # Eğer seçilen eylem güvenli değilse, en yüksek logitli güvenli eylemi seçelim
+                    if action not in safe_actions:
+                        action = int(max(safe_actions, key=lambda a: logits[a]))
+                    
+                    # PPO aksiyon geçmişini modelin beklediği formatta güncelleyelim
                     action_oh = [0.0]*5
-                    action_oh[ppo_action] = 1.0
+                    action_oh[action] = 1.0
                     env.action_history.append(action_oh)
                     
-                    # Q-values representation for frontend
+                    # Q-values representation for frontend (0=LEFT, 1=RIGHT, 2=UP, 3=DOWN)
                     q_values = [
                         float(logits[0]),  # LEFT
                         float(logits[1]),  # RIGHT
